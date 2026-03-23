@@ -1,0 +1,174 @@
+{
+  "name": "LiveTwin — Full System Bootstrap",
+  "description": "Orchestrates the complete LiveTwin pipeline: setup → data → DLT → ML → vector search → agents → dashboard. Run once to bootstrap. After first run, keep 'monitor-agent-loop' and 'dashboard-server' running as persistent jobs.",
+  "format": "MULTI_TASK",
+  "timeout_seconds": 7200,
+  "max_concurrent_runs": 1,
+  "tags": {
+    "project": "livetwin",
+    "hackathon": "hackbricks-2026"
+  },
+  "job_clusters": [
+    {
+      "job_cluster_key": "livetwin-cluster",
+      "new_cluster": {
+        "spark_version": "15.4.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 2,
+        "spark_conf": {
+          "spark.databricks.delta.preview.enabled": "true"
+        },
+        "runtime_engine": "PHOTON"
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "01-catalog-setup",
+      "description": "Create Unity Catalog, schemas, Lakebase instance, and all SQL tables",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/livetwin/src/00_setup/00_catalog_setup",
+        "base_parameters": {}
+      },
+      "job_cluster_key": "livetwin-cluster",
+      "timeout_seconds": 600,
+      "max_retries": 1,
+      "retry_on_timeout": false
+    },
+    {
+      "task_key": "02-download-data",
+      "description": "Download NASA CMAPSS dataset and write raw Delta tables",
+      "depends_on": [
+        { "task_key": "01-catalog-setup" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/livetwin/src/01_data/00_download_cmapss",
+        "base_parameters": {}
+      },
+      "job_cluster_key": "livetwin-cluster",
+      "timeout_seconds": 600,
+      "max_retries": 1
+    },
+    {
+      "task_key": "03-synthetic-incidents",
+      "description": "Generate synthetic historical incident records for Vector Search",
+      "depends_on": [
+        { "task_key": "02-download-data" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/livetwin/src/01_data/02_synthetic_incidents",
+        "base_parameters": {}
+      },
+      "job_cluster_key": "livetwin-cluster",
+      "timeout_seconds": 300,
+      "max_retries": 1
+    },
+    {
+      "task_key": "04-dlt-pipeline",
+      "description": "Deploy and run DLT medallion pipeline (Bronze → Silver → Gold)",
+      "depends_on": [
+        { "task_key": "02-download-data" }
+      ],
+      "pipeline_task": {
+        "pipeline_id": "{{dlt_pipeline_id}}",
+        "full_refresh": false
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 0
+    },
+    {
+      "task_key": "05-train-anomaly-detector",
+      "description": "Train Isolation Forest anomaly detection model and register to MLflow",
+      "depends_on": [
+        { "task_key": "04-dlt-pipeline" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/livetwin/src/03_ml/01_train_anomaly_detector",
+        "base_parameters": {}
+      },
+      "job_cluster_key": "livetwin-cluster",
+      "timeout_seconds": 900,
+      "max_retries": 1
+    },
+    {
+      "task_key": "06-train-rul-predictor",
+      "description": "Train GBR RUL predictor with 90% confidence interval and register to MLflow",
+      "depends_on": [
+        { "task_key": "04-dlt-pipeline" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/livetwin/src/03_ml/02_train_rul_predictor",
+        "base_parameters": {}
+      },
+      "job_cluster_key": "livetwin-cluster",
+      "timeout_seconds": 900,
+      "max_retries": 1
+    },
+    {
+      "task_key": "07-train-failure-classifier",
+      "description": "Train Random Forest 5-class failure mode classifier and register to MLflow",
+      "depends_on": [
+        { "task_key": "04-dlt-pipeline" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/livetwin/src/03_ml/03_train_failure_classifier",
+        "base_parameters": {}
+      },
+      "job_cluster_key": "livetwin-cluster",
+      "timeout_seconds": 900,
+      "max_retries": 1
+    },
+    {
+      "task_key": "08-setup-vector-search",
+      "description": "Create Vector Search endpoint, index historical incidents, enable similarity lookup",
+      "depends_on": [
+        { "task_key": "03-synthetic-incidents" },
+        { "task_key": "04-dlt-pipeline" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/livetwin/src/04_vector_search/setup_vector_search",
+        "base_parameters": {}
+      },
+      "job_cluster_key": "livetwin-cluster",
+      "timeout_seconds": 900,
+      "max_retries": 1
+    },
+    {
+      "task_key": "09-lakebase-sync",
+      "description": "Sync Silver sensor readings into Lakebase for sub-10ms OLTP reads",
+      "depends_on": [
+        { "task_key": "01-catalog-setup" },
+        { "task_key": "04-dlt-pipeline" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/livetwin/src/02_pipeline/lakebase_sync_job",
+        "base_parameters": {}
+      },
+      "job_cluster_key": "livetwin-cluster",
+      "timeout_seconds": 600,
+      "max_retries": 1
+    },
+    {
+      "task_key": "10-verify-system",
+      "description": "Run health checks: Lakebase connectivity, MLflow endpoints online, Vector Search index ready",
+      "depends_on": [
+        { "task_key": "05-train-anomaly-detector" },
+        { "task_key": "06-train-rul-predictor" },
+        { "task_key": "07-train-failure-classifier" },
+        { "task_key": "08-setup-vector-search" },
+        { "task_key": "09-lakebase-sync" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Repos/livetwin/src/09_workflow/verify_system",
+        "base_parameters": {}
+      },
+      "job_cluster_key": "livetwin-cluster",
+      "timeout_seconds": 300,
+      "max_retries": 0
+    }
+  ],
+  "email_notifications": {
+    "on_failure": []
+  },
+  "webhook_notifications": {}
+}
